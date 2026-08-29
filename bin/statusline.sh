@@ -76,6 +76,37 @@ format_epoch_time() {
     printf "%s" "$result"
 }
 
+iso_to_epoch() {
+    local iso_str="$1"
+
+    local epoch
+    epoch=$(date -d "${iso_str}" +%s 2>/dev/null)
+    if [ -n "$epoch" ]; then
+        echo "$epoch"
+        return 0
+    fi
+
+    local stripped="${iso_str%%.*}"
+    stripped="${stripped%%Z}"
+    stripped="${stripped%%+*}"
+    stripped="${stripped%%-[0-9][0-9]:[0-9][0-9]}"
+
+    if [[ "$iso_str" == *"Z"* ]] || [[ "$iso_str" == *"+00:00"* ]] || [[ "$iso_str" == *"-00:00"* ]]; then
+        epoch=$(env TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" +%s 2>/dev/null)
+        [ -z "$epoch" ] && epoch=$(env TZ=UTC date -d "${stripped/T/ }" +%s 2>/dev/null)
+    else
+        epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" +%s 2>/dev/null)
+        [ -z "$epoch" ] && epoch=$(date -d "${stripped/T/ }" +%s 2>/dev/null)
+    fi
+
+    if [ -n "$epoch" ]; then
+        echo "$epoch"
+        return 0
+    fi
+
+    return 1
+}
+
 # ── Extract JSON data ───────────────────────────────────
 # ponytail: line-per-field instead of @tsv — bash IFS collapses empty tab fields
 {
@@ -155,29 +186,95 @@ case "$effort" in
     *)      line1+="${dim}◑ ${effort}${reset}" ;;
 esac
 
-# ── Rate limit lines (each window may be independently absent; -1 marks absent) ──
+# ── Rate limit lines ────────────────────────────────────
 rate_lines=""
 bar_width=10
 
-if [ "$five_hour_pct" -ge 0 ] 2>/dev/null; then
-    five_hour_reset=$(format_epoch_time "$five_hour_reset_epoch" "time")
-    five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
-    five_hour_pct_color=$(color_for_pct "$five_hour_pct")
-    five_hour_pct_fmt=$(printf "%3d" "$five_hour_pct")
+add_rate_line() {
+    local label=$1 pct=$2 reset_epoch=$3 style=$4
+    local bar pct_color pct_fmt reset_str
+    bar=$(build_bar "$pct" "$bar_width")
+    pct_color=$(color_for_pct "$pct")
+    pct_fmt=$(printf "%3d" "$pct")
+    [ -n "$rate_lines" ] && rate_lines+="\n"
+    rate_lines+="${white}$(printf '%-12s' "$label")${reset} ${bar} ${pct_color}${pct_fmt}%${reset}"
+    reset_str=$(format_epoch_time "$reset_epoch" "$style")
+    [ -n "$reset_str" ] && rate_lines+=" ${dim}⟳${reset} ${white}${reset_str}${reset}"
+}
 
-    rate_lines+="${white}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset}"
-    [ -n "$five_hour_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
+# ponytail: OAuth usage API, not stdin — as of 2.1.251 stdin rate_limits carries
+# no model-scoped weekly window, which Claude Desktop shows as "Weekly Fable"
+cache_file="/tmp/claude/statusline-usage-cache.json"
+cache_max_age=60
+mkdir -p /tmp/claude
+
+needs_refresh=true
+if [ -f "$cache_file" ]; then
+    cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
+    [ $(( $(date +%s) - cache_mtime )) -lt "$cache_max_age" ] && needs_refresh=false
 fi
 
-if [ "$seven_day_pct" -ge 0 ] 2>/dev/null; then
-    seven_day_reset=$(format_epoch_time "$seven_day_reset_epoch" "datetime")
-    seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
-    seven_day_pct_color=$(color_for_pct "$seven_day_pct")
-    seven_day_pct_fmt=$(printf "%3d" "$seven_day_pct")
+if $needs_refresh; then
+    token="$CLAUDE_CODE_OAUTH_TOKEN"
+    if [ -z "$token" ] && command -v security >/dev/null 2>&1; then
+        token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+    fi
+    if [ -z "$token" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+        token=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+    fi
+    if [ -z "$token" ] && command -v secret-tool >/dev/null 2>&1; then
+        token=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+    fi
+
+    if [ -n "$token" ]; then
+        response=$(curl -s --max-time 5 \
+            -H "Authorization: Bearer $token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "User-Agent: claude-code/2.1.34" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+        if echo "$response" | jq -e '.limits' >/dev/null 2>&1; then
+            echo "$response" > "$cache_file"
+        fi
+    fi
+fi
+
+usage_data=""
+[ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
+
+if [ -n "$usage_data" ]; then
+    while IFS= read -r label && IFS= read -r pct && IFS= read -r reset_iso && IFS= read -r style; do
+        add_rate_line "$label" "$pct" "$(iso_to_epoch "$reset_iso")" "$style"
+    done <<EOF
+$(echo "$usage_data" | jq -r '.limits[]? | select(.kind == "session" or .kind == "weekly_all" or .kind == "weekly_scoped") |
+    (if .kind == "session" then "current"
+     elif .kind == "weekly_all" then "weekly"
+     else "weekly " + ((.scope.model.display_name // "model") | ascii_downcase) end),
+    ((.percent // 0) | round),
+    (.resets_at // "0"),
+    (if .kind == "session" then "time" else "datetime" end)' 2>/dev/null)
+EOF
+fi
+
+# stdin fallback carries only the five_hour/seven_day windows
+if [ -z "$rate_lines" ]; then
+    [ "$five_hour_pct" -ge 0 ] 2>/dev/null && add_rate_line "current" "$five_hour_pct" "$five_hour_reset_epoch" "time"
+    [ "$seven_day_pct" -ge 0 ] 2>/dev/null && add_rate_line "weekly" "$seven_day_pct" "$seven_day_reset_epoch" "datetime"
+fi
+
+if [ -n "$usage_data" ] && [ "$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')" = "true" ]; then
+    extra_pct=$(echo "$usage_data" | jq -r '.extra_usage.utilization // 0' | awk '{printf "%.0f", $1}')
+    extra_used=$(echo "$usage_data" | jq -r '.extra_usage.used_credits // 0' | awk '{printf "%.2f", $1/100}')
+    extra_limit=$(echo "$usage_data" | jq -r '.extra_usage.monthly_limit // 0' | awk '{printf "%.2f", $1/100}')
+    extra_bar=$(build_bar "$extra_pct" "$bar_width")
+    extra_pct_color=$(color_for_pct "$extra_pct")
+
+    extra_reset=$(date -v+1m -v1d +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [ -z "$extra_reset" ]; then
+        extra_reset=$(date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fi
 
     [ -n "$rate_lines" ] && rate_lines+="\n"
-    rate_lines+="${white}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset}"
-    [ -n "$seven_day_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${seven_day_reset}${reset}"
+    rate_lines+="${white}$(printf '%-12s' "extra")${reset} ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset} ${white}${extra_reset}${reset}"
 fi
 
 # ── Output ──────────────────────────────────────────────
