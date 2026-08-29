@@ -108,14 +108,35 @@ iso_to_epoch() {
 }
 
 # ── Extract JSON data ───────────────────────────────────
-model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
+# ponytail: line-per-field instead of @tsv — bash IFS collapses empty tab fields
+{
+    read -r model_name
+    read -r size
+    read -r input_tokens
+    read -r cache_create
+    read -r cache_read
+    read -r cwd
+    read -r session_start
+    read -r stdin_five_pct
+    read -r stdin_five_reset
+    read -r stdin_seven_pct
+    read -r stdin_seven_reset
+} <<EOF
+$(echo "$input" | jq -r '
+    (.model.display_name // "Claude"),
+    (.context_window.context_window_size // 200000),
+    (.context_window.current_usage.input_tokens // 0),
+    (.context_window.current_usage.cache_creation_input_tokens // 0),
+    (.context_window.current_usage.cache_read_input_tokens // 0),
+    (.cwd // ""),
+    (.session.start_time // ""),
+    (.rate_limits.five_hour.used_percentage // ""),
+    (.rate_limits.five_hour.resets_at // ""),
+    (.rate_limits.seven_day.used_percentage // ""),
+    (.rate_limits.seven_day.resets_at // "")')
+EOF
 
-size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
 [ "$size" -eq 0 ] 2>/dev/null && size=200000
-
-input_tokens=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
-cache_create=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-cache_read=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
 current=$(( input_tokens + cache_create + cache_read ))
 
 if [ "$size" -gt 0 ]; then
@@ -132,8 +153,7 @@ fi
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
 pct_color=$(color_for_pct "$pct_used")
-cwd=$(echo "$input" | jq -r '.cwd // ""')
-[ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
+[ -z "$cwd" ] && cwd=$(pwd)
 dirname=$(basename "$cwd")
 
 git_branch=""
@@ -146,8 +166,7 @@ if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 session_duration=""
-session_start=$(echo "$input" | jq -r '.session.start_time // empty')
-if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
+if [ -n "$session_start" ]; then
     start_epoch=$(iso_to_epoch "$session_start")
     if [ -n "$start_epoch" ]; then
         now_epoch=$(date +%s)
@@ -195,13 +214,12 @@ five_hour_reset_epoch=""
 seven_day_pct=""
 seven_day_reset_epoch=""
 
-stdin_five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 if [ -n "$stdin_five_pct" ]; then
     has_stdin_rates=true
     five_hour_pct=$(printf "%.0f" "$stdin_five_pct")
-    five_hour_reset_epoch=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-    seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' | awk '{printf "%.0f", $1}')
-    seven_day_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
+    five_hour_reset_epoch=$stdin_five_reset
+    seven_day_pct=$(printf "%.0f" "${stdin_seven_pct:-0}")
+    seven_day_reset_epoch=$stdin_seven_reset
 fi
 
 # ── Fallback: API call (cached) ────────────────────────
