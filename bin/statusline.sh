@@ -76,74 +76,28 @@ format_epoch_time() {
     printf "%s" "$result"
 }
 
-iso_to_epoch() {
-    local iso_str="$1"
-
-    local epoch
-    epoch=$(date -d "${iso_str}" +%s 2>/dev/null)
-    if [ -n "$epoch" ]; then
-        echo "$epoch"
-        return 0
-    fi
-
-    local stripped="${iso_str%%.*}"
-    stripped="${stripped%%Z}"
-    stripped="${stripped%%+*}"
-    stripped="${stripped%%-[0-9][0-9]:[0-9][0-9]}"
-
-    if [[ "$iso_str" == *"Z"* ]] || [[ "$iso_str" == *"+00:00"* ]] || [[ "$iso_str" == *"-00:00"* ]]; then
-        epoch=$(env TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" +%s 2>/dev/null)
-        [ -z "$epoch" ] && epoch=$(env TZ=UTC date -d "${stripped/T/ }" +%s 2>/dev/null)
-    else
-        epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" +%s 2>/dev/null)
-        [ -z "$epoch" ] && epoch=$(date -d "${stripped/T/ }" +%s 2>/dev/null)
-    fi
-
-    if [ -n "$epoch" ]; then
-        echo "$epoch"
-        return 0
-    fi
-
-    return 1
-}
-
 # ── Extract JSON data ───────────────────────────────────
 # ponytail: line-per-field instead of @tsv — bash IFS collapses empty tab fields
 {
     read -r model_name
-    read -r size
-    read -r input_tokens
-    read -r cache_create
-    read -r cache_read
+    read -r pct_used
     read -r cwd
-    read -r session_start
-    read -r stdin_five_pct
-    read -r stdin_five_reset
-    read -r stdin_seven_pct
-    read -r stdin_seven_reset
+    read -r duration_ms
+    read -r five_hour_pct
+    read -r five_hour_reset_epoch
+    read -r seven_day_pct
+    read -r seven_day_reset_epoch
 } <<EOF
 $(echo "$input" | jq -r '
     (.model.display_name // "Claude"),
-    (.context_window.context_window_size // 200000),
-    (.context_window.current_usage.input_tokens // 0),
-    (.context_window.current_usage.cache_creation_input_tokens // 0),
-    (.context_window.current_usage.cache_read_input_tokens // 0),
+    ((.context_window.used_percentage // 0) | floor),
     (.cwd // ""),
-    (.session.start_time // ""),
-    (.rate_limits.five_hour.used_percentage // ""),
-    (.rate_limits.five_hour.resets_at // ""),
-    (.rate_limits.seven_day.used_percentage // ""),
-    (.rate_limits.seven_day.resets_at // "")')
+    (.cost.total_duration_ms // 0),
+    ((.rate_limits.five_hour.used_percentage // -1) | round),
+    (.rate_limits.five_hour.resets_at // 0),
+    ((.rate_limits.seven_day.used_percentage // -1) | round),
+    (.rate_limits.seven_day.resets_at // 0)')
 EOF
-
-[ "$size" -eq 0 ] 2>/dev/null && size=200000
-current=$(( input_tokens + cache_create + cache_read ))
-
-if [ "$size" -gt 0 ]; then
-    pct_used=$(( current * 100 / size ))
-else
-    pct_used=0
-fi
 
 effort="default"
 settings_path="$HOME/.claude/settings.json"
@@ -166,19 +120,13 @@ if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 session_duration=""
-if [ -n "$session_start" ]; then
-    start_epoch=$(iso_to_epoch "$session_start")
-    if [ -n "$start_epoch" ]; then
-        now_epoch=$(date +%s)
-        elapsed=$(( now_epoch - start_epoch ))
-        if [ "$elapsed" -ge 3600 ]; then
-            session_duration="$(( elapsed / 3600 ))h$(( (elapsed % 3600) / 60 ))m"
-        elif [ "$elapsed" -ge 60 ]; then
-            session_duration="$(( elapsed / 60 ))m"
-        else
-            session_duration="${elapsed}s"
-        fi
-    fi
+elapsed=$(( duration_ms / 1000 ))
+if [ "$elapsed" -ge 3600 ]; then
+    session_duration="$(( elapsed / 3600 ))h$(( (elapsed % 3600) / 60 ))m"
+elif [ "$elapsed" -ge 60 ]; then
+    session_duration="$(( elapsed / 60 ))m"
+elif [ "$elapsed" -gt 0 ]; then
+    session_duration="${elapsed}s"
 fi
 
 skip_perms=""
@@ -207,109 +155,11 @@ case "$effort" in
     *)      line1+="${dim}◑ ${effort}${reset}" ;;
 esac
 
-# ── Rate limits from stdin (primary) ───────────────────
-has_stdin_rates=false
-five_hour_pct=""
-five_hour_reset_epoch=""
-seven_day_pct=""
-seven_day_reset_epoch=""
-
-if [ -n "$stdin_five_pct" ]; then
-    has_stdin_rates=true
-    five_hour_pct=$(printf "%.0f" "$stdin_five_pct")
-    five_hour_reset_epoch=$stdin_five_reset
-    seven_day_pct=$(printf "%.0f" "${stdin_seven_pct:-0}")
-    seven_day_reset_epoch=$stdin_seven_reset
-fi
-
-# ── Fallback: API call (cached) ────────────────────────
-cache_file="/tmp/claude/statusline-usage-cache.json"
-cache_max_age=60
-mkdir -p /tmp/claude
-
-usage_data=""
-extra_enabled="false"
-
-if ! $has_stdin_rates; then
-    needs_refresh=true
-
-    if [ -f "$cache_file" ]; then
-        cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
-        now=$(date +%s)
-        cache_age=$(( now - cache_mtime ))
-        if [ "$cache_age" -lt "$cache_max_age" ]; then
-            needs_refresh=false
-            usage_data=$(cat "$cache_file" 2>/dev/null)
-        fi
-    fi
-
-    if $needs_refresh; then
-        token=""
-        if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            token="$CLAUDE_CODE_OAUTH_TOKEN"
-        elif command -v security >/dev/null 2>&1; then
-            blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-            if [ -n "$blob" ]; then
-                token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-            fi
-        fi
-        if [ -z "$token" ] || [ "$token" = "null" ]; then
-            creds_file="${HOME}/.claude/.credentials.json"
-            if [ -f "$creds_file" ]; then
-                token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-            fi
-        fi
-        if [ -z "$token" ] || [ "$token" = "null" ]; then
-            if command -v secret-tool >/dev/null 2>&1; then
-                blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
-                if [ -n "$blob" ]; then
-                    token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-                fi
-            fi
-        fi
-
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            response=$(curl -s --max-time 5 \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $token" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                -H "User-Agent: claude-code/2.1.34" \
-                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-            if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
-                usage_data="$response"
-                echo "$response" > "$cache_file"
-            fi
-        fi
-        if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
-            usage_data=$(cat "$cache_file" 2>/dev/null)
-        fi
-    fi
-
-    if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-        five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
-        five_hour_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
-        five_hour_reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
-        seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
-        seven_day_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
-        seven_day_reset_epoch=$(iso_to_epoch "$seven_day_reset_iso")
-
-        extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
-    fi
-else
-    if [ -f "$cache_file" ]; then
-        usage_data=$(cat "$cache_file" 2>/dev/null)
-        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-            extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
-        fi
-    fi
-fi
-
-# ── Rate limit lines ────────────────────────────────────
+# ── Rate limit lines (each window may be independently absent; -1 marks absent) ──
 rate_lines=""
 bar_width=10
 
-if [ -n "$five_hour_pct" ]; then
+if [ "$five_hour_pct" -ge 0 ] 2>/dev/null; then
     five_hour_reset=$(format_epoch_time "$five_hour_reset_epoch" "time")
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
@@ -319,7 +169,7 @@ if [ -n "$five_hour_pct" ]; then
     [ -n "$five_hour_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
 fi
 
-if [ -n "$seven_day_pct" ]; then
+if [ "$seven_day_pct" -ge 0 ] 2>/dev/null; then
     seven_day_reset=$(format_epoch_time "$seven_day_reset_epoch" "datetime")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
@@ -328,22 +178,6 @@ if [ -n "$seven_day_pct" ]; then
     [ -n "$rate_lines" ] && rate_lines+="\n"
     rate_lines+="${white}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset}"
     [ -n "$seven_day_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${seven_day_reset}${reset}"
-fi
-
-if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
-    extra_pct=$(echo "$usage_data" | jq -r '.extra_usage.utilization // 0' | awk '{printf "%.0f", $1}')
-    extra_used=$(echo "$usage_data" | jq -r '.extra_usage.used_credits // 0' | awk '{printf "%.2f", $1/100}')
-    extra_limit=$(echo "$usage_data" | jq -r '.extra_usage.monthly_limit // 0' | awk '{printf "%.2f", $1/100}')
-    extra_bar=$(build_bar "$extra_pct" "$bar_width")
-    extra_pct_color=$(color_for_pct "$extra_pct")
-
-    extra_reset=$(date -v+1m -v1d +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    if [ -z "$extra_reset" ]; then
-        extra_reset=$(date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    fi
-
-    [ -n "$rate_lines" ] && rate_lines+="\n"
-    rate_lines+="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset} ${white}${extra_reset}${reset}"
 fi
 
 # ── Output ──────────────────────────────────────────────
