@@ -118,6 +118,7 @@ iso_to_epoch() {
     read -r five_hour_reset_epoch
     read -r seven_day_pct
     read -r seven_day_reset_epoch
+    read -r effort
 } <<EOF
 $(echo "$input" | jq -r '
     (.model.display_name // "Claude"),
@@ -127,13 +128,14 @@ $(echo "$input" | jq -r '
     ((.rate_limits.five_hour.used_percentage // -1) | round),
     (.rate_limits.five_hour.resets_at // 0),
     ((.rate_limits.seven_day.used_percentage // -1) | round),
-    (.rate_limits.seven_day.resets_at // 0)')
+    (.rate_limits.seven_day.resets_at // 0),
+    (.effort.level // "")')
 EOF
 
-effort="default"
-settings_path="$HOME/.claude/settings.json"
-if [ -f "$settings_path" ]; then
-    effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
+# ponytail: stdin, not settings.json — /effort is session-scoped and never
+# writes effortLevel; stdin carries the resolved level (settings + flag + /effort)
+if [ -z "$effort" ]; then
+    effort=$(jq -r '.effortLevel // "default"' "$HOME/.claude/settings.json" 2>/dev/null || echo default)
 fi
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
@@ -180,7 +182,7 @@ if [ -n "$session_duration" ]; then
 fi
 line1+="${sep}"
 case "$effort" in
-    high)   line1+="${magenta}● ${effort}${reset}" ;;
+    high|xhigh|max) line1+="${magenta}● ${effort}${reset}" ;;
     medium) line1+="${dim}◑ ${effort}${reset}" ;;
     low)    line1+="${dim}◔ ${effort}${reset}" ;;
     *)      line1+="${dim}◑ ${effort}${reset}" ;;
