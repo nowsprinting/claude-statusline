@@ -119,6 +119,13 @@ iso_to_epoch() {
     read -r seven_day_pct
     read -r seven_day_reset_epoch
     read -r effort
+    read -r pc_warm
+    read -r pc_ttl
+    read -r pc_expires_at
+    read -r pc_hit_pct
+    read -r pc_misses
+    read -r pc_miss_cause
+    read -r pc_recache_k
 } <<EOF
 $(echo "$input" | jq -r '
     (.model.display_name // "Claude"),
@@ -129,7 +136,15 @@ $(echo "$input" | jq -r '
     (.rate_limits.five_hour.resets_at // 0),
     ((.rate_limits.seven_day.used_percentage // -1) | round),
     (.rate_limits.seven_day.resets_at // 0),
-    (.effort.level // "")')
+    (.effort.level // ""),
+    # ponytail: not `// ""` — it treats false as absent and would hide a cold cache
+    (.prompt_cache.warm | if . == null then "" else tostring end),
+    (.prompt_cache.ttl // ""),
+    (.prompt_cache.expires_at // ""),
+    (.prompt_cache.hit_ratio | if . == null then "" else . * 100 | round end),
+    (.prompt_cache.misses // ""),
+    (.prompt_cache.last_miss_cause.causes // [] | join(", ")),
+    (.prompt_cache.recache_tokens_if_cold | if . == null then "" else . / 1000 | round end)')
 EOF
 
 # ponytail: stdin, not settings.json — /effort is session-scoped and never
@@ -261,6 +276,55 @@ fi
 if [ -z "$rate_lines" ]; then
     [ "$five_hour_pct" -ge 0 ] 2>/dev/null && add_rate_line "current" "$five_hour_pct" "$five_hour_reset_epoch" "time"
     [ "$seven_day_pct" -ge 0 ] 2>/dev/null && add_rate_line "weekly" "$seven_day_pct" "$seven_day_reset_epoch" "datetime"
+fi
+
+# ── Prompt cache line ───────────────────────────────────
+if [ -n "$pc_warm" ]; then
+    pc_left=""
+    [ -n "$pc_expires_at" ] && pc_left=$(( pc_expires_at - $(date +%s) ))
+    # stdin may still say warm when the expires_at re-run fires, so trust the clock
+    [ -n "$pc_left" ] && [ "$pc_left" -le 0 ] && pc_warm=false
+
+    if [ "$pc_warm" = "true" ]; then
+        case "$pc_ttl" in
+            *h) pc_ttl_secs=$(( ${pc_ttl%h} * 3600 )) ;;
+            *m) pc_ttl_secs=$(( ${pc_ttl%m} * 60 )) ;;
+            *)  pc_ttl_secs="" ;;
+        esac
+        pc_color=$green
+        pc_tail=""
+        cache_line="●"
+        [ -n "$pc_ttl" ] && cache_line+=" ${pc_ttl}"
+        if [ -n "$pc_ttl_secs" ] && [ -n "$pc_left" ]; then
+            [ $(( pc_left * 5 )) -lt "$pc_ttl_secs" ] && pc_color=$yellow
+            # not build_bar: its colors rank usage, where full means danger
+            pc_width=6
+            pc_filled=$(( (pc_left * pc_width * 2 + pc_ttl_secs) / (pc_ttl_secs * 2) ))
+            [ "$pc_filled" -gt "$pc_width" ] && pc_filled=$pc_width
+            pc_bar=""
+            for ((i=0; i<pc_width; i++)); do
+                [ "$i" -lt "$pc_filled" ] && pc_bar+="█" || pc_bar+="░"
+            done
+            cache_line+=" ${pc_bar}"
+        fi
+        if [ -n "$pc_left" ]; then
+            # ceil, not floor — "0m left" would read as already cold
+            if [ "$pc_left" -lt 60 ]; then cache_line+=" ${pc_left}s left"
+            else cache_line+=" $(( (pc_left + 59) / 60 ))m left"
+            fi
+        fi
+        [ -n "$pc_hit_pct" ] && pc_tail+="${sep}${white}hit ${pc_hit_pct}%${reset}"
+        [ -n "$pc_misses" ] && pc_tail+="${sep}${white}misses ${pc_misses}${reset}"
+    else
+        pc_color=$red
+        pc_tail=""
+        cache_line="○ cold"
+        [ -n "$pc_recache_k" ] && pc_tail+="${sep}${white}next message re-caches ${pc_recache_k}k tokens${reset}"
+        [ -n "$pc_miss_cause" ] && pc_tail+="${sep}${white}last miss: ${pc_miss_cause}${reset}"
+    fi
+
+    # prepended here, not before the usage loop — the stdin fallback keys off an empty rate_lines
+    rate_lines="${white}cache${reset} ${pc_color}${cache_line}${reset}${pc_tail}${rate_lines:+\n}${rate_lines}"
 fi
 
 if [ -n "$usage_data" ] && [ "$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')" = "true" ]; then
