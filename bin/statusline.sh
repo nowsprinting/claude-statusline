@@ -153,7 +153,7 @@ if [ -z "$effort" ]; then
     effort=$(jq -r '.effortLevel // "default"' "$HOME/.claude/settings.json" 2>/dev/null || echo default)
 fi
 
-# ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
+# ── LINE 1: Model │ Effort │ Context % │ Directory (branch) │ Session ──
 pct_color=$(color_for_pct "$pct_used")
 [ -z "$cwd" ] && cwd=$(pwd)
 dirname=$(basename "$cwd")
@@ -185,6 +185,13 @@ fi
 
 line1="${blue}${model_name}${reset}"
 line1+="${sep}"
+case "$effort" in
+    high|xhigh|max) line1+="${magenta}● ${effort}${reset}" ;;
+    medium) line1+="${dim}◑ ${effort}${reset}" ;;
+    low)    line1+="${dim}◔ ${effort}${reset}" ;;
+    *)      line1+="${dim}◑ ${effort}${reset}" ;;
+esac
+line1+="${sep}"
 line1+="✍️ ${pct_color}${pct_used}%${reset}"
 line1+="${sep}"
 line1+="${skip_perms}${cyan}${dirname}${reset}"
@@ -195,13 +202,6 @@ if [ -n "$session_duration" ]; then
     line1+="${sep}"
     line1+="${dim}⏱ ${reset}${white}${session_duration}${reset}"
 fi
-line1+="${sep}"
-case "$effort" in
-    high|xhigh|max) line1+="${magenta}● ${effort}${reset}" ;;
-    medium) line1+="${dim}◑ ${effort}${reset}" ;;
-    low)    line1+="${dim}◔ ${effort}${reset}" ;;
-    *)      line1+="${dim}◑ ${effort}${reset}" ;;
-esac
 
 # ── Rate limit lines ────────────────────────────────────
 rate_lines=""
