@@ -126,6 +126,7 @@ iso_to_epoch() {
     read -r pc_misses
     read -r pc_miss_cause
     read -r pc_recache_k
+    read -r scratchpad_dir
 } <<EOF
 $(echo "$input" | jq -r '
     (.model.display_name // "Claude"),
@@ -144,7 +145,8 @@ $(echo "$input" | jq -r '
     (.prompt_cache.hit_ratio | if . == null then "" else . * 100 | round end),
     (.prompt_cache.misses // ""),
     (.prompt_cache.last_miss_cause.causes // [] | join(", ")),
-    (.prompt_cache.recache_tokens_if_cold | if . == null then "" else . / 1000 | round end)')
+    (.prompt_cache.recache_tokens_if_cold | if . == null then "" else . / 1000 | round end),
+    (.scratchpad_dir // "")')
 EOF
 
 # ponytail: stdin, not settings.json — /effort is session-scoped and never
@@ -193,6 +195,10 @@ case "$effort" in
 esac
 line1+="${sep}"
 line1+="✍️ ${pct_color}${pct_used}%${reset}"
+if [ -n "$scratchpad_dir" ] && [ -s "$scratchpad_dir/record-compaction" ]; then
+    stars=$(awk -F' [|] ' '{printf "%s", ($2 == "manual" ? "★" : "☆")}' "$scratchpad_dir/record-compaction")
+    line1+=" ${white}${stars}${reset}"
+fi
 line1+="${sep}"
 line1+="${skip_perms}${cyan}${dirname}${reset}"
 if [ -n "$git_branch" ]; then
